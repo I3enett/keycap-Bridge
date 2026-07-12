@@ -1,8 +1,9 @@
 """
-Keycap Color-by-Number: Pollinations image-generation bridge.
-Fetches an image from Pollinations, shrinks it to the board's resolution, and maps
-every pixel to the nearest of the game's 8 palette colors, returning the grid Roblox
-expects: { "grid": [[1..8, ...], ...] }
+Keycap Color-by-Number: Pollinations image-generation bridge (v2 -- adaptive palette).
+Fetches an image from Pollinations, shrinks it to the board's resolution, and extracts
+an adaptive palette (up to `colors` distinct colors, chosen from THIS image, not a fixed
+list) so the in-game colors actually match what was generated. Returns:
+  { "grid": [[1..N, ...], ...], "palette": [[r,g,b], ...] }
 """
 
 import io
@@ -14,32 +15,11 @@ from PIL import Image
 
 app = Flask(__name__)
 
-# Must match ReplicatedStorage.KeycapRemakeConfig.Palette exactly (in order, 1-indexed).
-PALETTE = [
-    (36, 39, 50),      # 1 Background
-    (247, 230, 187),   # 2 Cream
-    (239, 86, 122),    # 3 Pink
-    (255, 174, 69),    # 4 Orange
-    (86, 212, 142),    # 5 Green
-    (79, 166, 255),    # 6 Blue
-    (147, 98, 255),    # 7 Purple
-    (255, 244, 92),    # 8 Glow
-]
-
-# Blunt, extend-as-needed defense-in-depth on top of Pollinations' own safe=true filter.
 BLOCKED_SUBSTRINGS = ["nude", "naked", "nsfw", "porn", "sex", "explicit", "hentai", "erotic"]
 
 MAX_PROMPT_LEN = 100
 POLLINATIONS_TIMEOUT_SECONDS = 25
-
-
-def nearest_palette_index(rgb):
-    best_index, best_dist = 0, None
-    for i, p in enumerate(PALETTE):
-        dist = sum((a - b) ** 2 for a, b in zip(rgb, p))
-        if best_dist is None or dist < best_dist:
-            best_dist, best_index = dist, i
-    return best_index + 1  # Lua/Roblox side is 1-indexed
+DEFAULT_MAX_COLORS = 40
 
 
 def is_blocked(prompt: str) -> bool:
@@ -53,6 +33,8 @@ def generate():
     prompt = str(data.get("prompt") or "").strip()[:MAX_PROMPT_LEN]
     size = int(data.get("size") or 25)
     size = max(4, min(size, 128))
+    max_colors = int(data.get("colors") or DEFAULT_MAX_COLORS)
+    max_colors = max(2, min(max_colors, 64))
 
     if not prompt:
         return jsonify({"error": "empty prompt"}), 400
@@ -66,7 +48,7 @@ def generate():
         "height": size * 8,
         "nologo": "true",
         "safe": "true",
-        "model": "flux",  # free, unlimited tier per Pollinations' docs
+        "model": "flux",
     }
 
     try:
@@ -78,12 +60,27 @@ def generate():
 
     img = img.resize((size, size), Image.LANCZOS)
 
-    grid = []
-    for y in range(size):
-        row = [nearest_palette_index(img.getpixel((x, y))) for x in range(size)]
-        grid.append(row)
+    # Adaptive quantization: picks the best `max_colors` colors FOR THIS IMAGE, instead
+    # of snapping to a fixed palette. This is what makes the in-game colors "realistic"
+    # and specific to whatever was drawn.
+    quantized = img.quantize(colors=max_colors, method=Image.Quantize.MAXCOVERAGE)
+    used = quantized.getcolors()  # [(pixel_count, palette_index), ...] -- only indices that appear
+    used_indices = sorted(idx for _, idx in used)
+    index_map = {old: new + 1 for new, old in enumerate(used_indices)}  # compact, 1-indexed
 
-    return jsonify({"grid": grid})
+    flat_palette = quantized.getpalette()
+    palette_out = [
+        [flat_palette[i * 3], flat_palette[i * 3 + 1], flat_palette[i * 3 + 2]]
+        for i in used_indices
+    ]
+
+    pixels = quantized.load()
+    grid = [
+        [index_map[pixels[x, y]] for x in range(size)]
+        for y in range(size)
+    ]
+
+    return jsonify({"grid": grid, "palette": palette_out})
 
 
 @app.route("/", methods=["GET"])
