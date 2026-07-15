@@ -1,9 +1,8 @@
 """
-Keycap Color-by-Number: Pollinations image-generation bridge (v2 -- adaptive palette).
-Fetches an image from Pollinations, shrinks it to the board's resolution, and extracts
-an adaptive palette (up to `colors` distinct colors, chosen from THIS image, not a fixed
-list) so the in-game colors actually match what was generated. Returns:
-  { "grid": [[1..N, ...], ...], "palette": [[r,g,b], ...] }
+Keycap Color-by-Number: Pollinations image-generation bridge (v3 -- high-resolution grids).
+Fetches a consistently sized source image from Pollinations, resamples it to the requested
+board resolution, and extracts an adaptive palette chosen from that image. Returns:
+  { "grid": [[1..N, ...], ...], "palette": [[r,g,b], ...], "width": W, "height": H }
 """
 
 import io
@@ -18,8 +17,10 @@ app = Flask(__name__)
 BLOCKED_SUBSTRINGS = ["nude", "naked", "nsfw", "porn", "sex", "explicit", "hentai", "erotic"]
 
 MAX_PROMPT_LEN = 100
-POLLINATIONS_TIMEOUT_SECONDS = 25
+POLLINATIONS_TIMEOUT_SECONDS = 90
 DEFAULT_MAX_COLORS = 40
+MAX_OUTPUT_SIZE = 313
+SOURCE_IMAGE_SIZE = 1024
 
 
 def is_blocked(prompt: str) -> bool:
@@ -27,14 +28,20 @@ def is_blocked(prompt: str) -> bool:
     return any(word in lowered for word in BLOCKED_SUBSTRINGS)
 
 
+def bounded_int(value, default, minimum, maximum):
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        parsed = default
+    return max(minimum, min(parsed, maximum))
+
+
 @app.route("/generate", methods=["POST"])
 def generate():
     data = request.get_json(force=True, silent=True) or {}
     prompt = str(data.get("prompt") or "").strip()[:MAX_PROMPT_LEN]
-    size = int(data.get("size") or 25)
-    size = max(4, min(size, 128))
-    max_colors = int(data.get("colors") or DEFAULT_MAX_COLORS)
-    max_colors = max(2, min(max_colors, 64))
+    size = bounded_int(data.get("size"), 125, 4, MAX_OUTPUT_SIZE)
+    max_colors = bounded_int(data.get("colors"), DEFAULT_MAX_COLORS, 2, 64)
 
     if not prompt:
         return jsonify({"error": "empty prompt"}), 400
@@ -44,8 +51,8 @@ def generate():
     encoded_prompt = urllib.parse.quote(prompt)
     url = f"https://image.pollinations.ai/prompt/{encoded_prompt}"
     params = {
-        "width": size * 8,
-        "height": size * 8,
+        "width": SOURCE_IMAGE_SIZE,
+        "height": SOURCE_IMAGE_SIZE,
         "nologo": "true",
         "safe": "true",
         "model": "flux",
@@ -58,15 +65,14 @@ def generate():
     except Exception as exc:
         return jsonify({"error": f"image generation failed: {exc}"}), 502
 
-    img = img.resize((size, size), Image.LANCZOS)
+    resampling = getattr(Image, "Resampling", Image)
+    img = img.resize((size, size), resampling.LANCZOS)
 
-    # Adaptive quantization: picks the best `max_colors` colors FOR THIS IMAGE, instead
-    # of snapping to a fixed palette. This is what makes the in-game colors "realistic"
-    # and specific to whatever was drawn.
+    # Pick the best colors for this specific image instead of using a fixed palette.
     quantized = img.quantize(colors=max_colors, method=Image.Quantize.MAXCOVERAGE)
-    used = quantized.getcolors()  # [(pixel_count, palette_index), ...] -- only indices that appear
+    used = quantized.getcolors() or []
     used_indices = sorted(idx for _, idx in used)
-    index_map = {old: new + 1 for new, old in enumerate(used_indices)}  # compact, 1-indexed
+    index_map = {old: new + 1 for new, old in enumerate(used_indices)}
 
     flat_palette = quantized.getpalette()
     palette_out = [
@@ -80,12 +86,21 @@ def generate():
         for y in range(size)
     ]
 
-    return jsonify({"grid": grid, "palette": palette_out})
+    return jsonify({
+        "grid": grid,
+        "palette": palette_out,
+        "width": size,
+        "height": size,
+    })
 
 
 @app.route("/", methods=["GET"])
 def health():
-    return jsonify({"status": "ok"})
+    return jsonify({
+        "status": "ok",
+        "max_output_size": MAX_OUTPUT_SIZE,
+        "source_image_size": SOURCE_IMAGE_SIZE,
+    })
 
 
 if __name__ == "__main__":
