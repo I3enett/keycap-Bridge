@@ -155,8 +155,11 @@ def library_search():
     data = request.get_json(force=True, silent=True) or {}
     query = str(data.get("query") or "").strip()[:MAX_PROMPT_LEN]
     limit = bounded_int(data.get("limit"), 5, 1, 5)
-    preview_size = bounded_int(data.get("preview_size"), 18, 12, 24)
-    preview_colors = bounded_int(data.get("colors"), 12, 4, 16)
+    # Photo-library cards are displayed through Roblox EditableImages. Keep enough
+    # detail here for them to look like photos; board conversion still happens only
+    # after a player selects a result.
+    preview_size = bounded_int(data.get("preview_size"), 96, 32, 96)
+    preview_colors = bounded_int(data.get("colors"), 128, 16, 128)
     if len(query) < 2:
         return jsonify({"error": "search must be at least 2 characters"}), 400
     if is_blocked(query):
