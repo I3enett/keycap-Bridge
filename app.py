@@ -1,12 +1,15 @@
 """
-Keycap Color-by-Number bridge (v4 -- unlimited AI Horde queue).
-Roblox starts a free community-powered image job, polls it with short HTTP requests,
-then receives the same quantized grid/palette JSON used by the game.
+Keycap Color-by-Number bridge (v5 -- AI Horde plus photo library previews).
+
+The original AI generation endpoints remain unchanged. The photo-library endpoints
+use Wikimedia Commons, so the Roblox game can search, preview, and convert public
+images without exposing an API key.
 """
 
 import base64
 import io
 import os
+from urllib.parse import quote, urlparse
 
 import requests
 from flask import Flask, jsonify, request
@@ -21,6 +24,9 @@ DEFAULT_MAX_COLORS = 40
 MAX_OUTPUT_SIZE = 313
 SOURCE_IMAGE_SIZE = 512
 REQUEST_TIMEOUT_SECONDS = 30
+MAX_LIBRARY_DOWNLOAD_BYTES = 12 * 1024 * 1024
+COMMONS_API_URL = "https://commons.wikimedia.org/w/api.php"
+COMMONS_USER_AGENT = "KeycapColorByNumber/1.0 (Roblox photo library; I3enett)"
 
 # Anonymous usage is officially supported with ten zeroes and has no image charge.
 # A free registered Horde key can optionally be placed in Render for better queue priority.
@@ -69,9 +75,17 @@ def decode_image_value(value: str) -> Image.Image:
     return Image.open(io.BytesIO(base64.b64decode(value))).convert("RGB")
 
 
-def grid_response(img: Image.Image, size: int, max_colors: int, generation: dict):
+def square_crop(img: Image.Image) -> Image.Image:
+    width, height = img.size
+    edge = min(width, height)
+    left = (width - edge) // 2
+    top = (height - edge) // 2
+    return img.crop((left, top, left + edge, top + edge))
+
+
+def quantized_grid(img: Image.Image, size: int, max_colors: int) -> dict:
     resampling = getattr(Image, "Resampling", Image)
-    img = img.resize((size, size), resampling.LANCZOS)
+    img = square_crop(img.convert("RGB")).resize((size, size), resampling.LANCZOS)
     quantized = img.quantize(colors=max_colors, method=Image.Quantize.MAXCOVERAGE)
     used = quantized.getcolors() or []
     used_indices = sorted(index for _, index in used)
@@ -86,15 +100,150 @@ def grid_response(img: Image.Image, size: int, max_colors: int, generation: dict
         [index_map[pixels[x, y]] for x in range(size)]
         for y in range(size)
     ]
-    return jsonify({
-        "status": "complete",
+    return {
         "grid": grid,
         "palette": palette_out,
         "width": size,
         "height": size,
+    }
+
+
+def grid_response(img: Image.Image, size: int, max_colors: int, generation: dict):
+    result = quantized_grid(img, size, max_colors)
+    result.update({
+        "status": "complete",
         "provider": "ai-horde",
         "model": generation.get("model"),
     })
+    return jsonify(result)
+
+
+def is_allowed_commons_image_url(value: str) -> bool:
+    try:
+        parsed = urlparse(value)
+        return (
+            parsed.scheme == "https"
+            and parsed.hostname == "upload.wikimedia.org"
+            and not parsed.username
+            and not parsed.password
+            and parsed.port is None
+            and bool(parsed.path)
+        )
+    except (TypeError, ValueError):
+        return False
+
+
+def download_commons_image(url: str) -> Image.Image:
+    if not is_allowed_commons_image_url(url):
+        raise ValueError("unsupported photo source")
+    response = requests.get(
+        url,
+        headers={"User-Agent": COMMONS_USER_AGENT},
+        timeout=REQUEST_TIMEOUT_SECONDS,
+    )
+    response.raise_for_status()
+    content_length = response.headers.get("Content-Length")
+    if content_length and int(content_length) > MAX_LIBRARY_DOWNLOAD_BYTES:
+        raise ValueError("photo is too large")
+    if len(response.content) > MAX_LIBRARY_DOWNLOAD_BYTES:
+        raise ValueError("photo is too large")
+    return Image.open(io.BytesIO(response.content)).convert("RGB")
+
+
+@app.route("/library/search", methods=["POST"])
+def library_search():
+    data = request.get_json(force=True, silent=True) or {}
+    query = str(data.get("query") or "").strip()[:MAX_PROMPT_LEN]
+    limit = bounded_int(data.get("limit"), 5, 1, 5)
+    preview_size = bounded_int(data.get("preview_size"), 18, 12, 24)
+    preview_colors = bounded_int(data.get("colors"), 12, 4, 16)
+    if len(query) < 2:
+        return jsonify({"error": "search must be at least 2 characters"}), 400
+    if is_blocked(query):
+        return jsonify({"error": "blocked search"}), 400
+
+    params = {
+        "action": "query",
+        "generator": "search",
+        "gsrsearch": query + " filetype:bitmap",
+        "gsrnamespace": 6,
+        "gsrlimit": 15,
+        "prop": "imageinfo",
+        "iiprop": "url|mime|size",
+        "iiurlwidth": 640,
+        "iiurlheight": 640,
+        "format": "json",
+        "formatversion": 2,
+    }
+
+    try:
+        response = requests.get(
+            COMMONS_API_URL,
+            params=params,
+            headers={"User-Agent": COMMONS_USER_AGENT},
+            timeout=REQUEST_TIMEOUT_SECONDS,
+        )
+        response.raise_for_status()
+        pages = (response.json().get("query") or {}).get("pages") or []
+        results = []
+        for page in pages:
+            image_info = (page.get("imageinfo") or [None])[0]
+            if not image_info:
+                continue
+            mime = str(image_info.get("mime") or "").lower()
+            if mime not in {"image/jpeg", "image/png", "image/webp"}:
+                continue
+            source_url = image_info.get("thumburl") or image_info.get("url")
+            if not source_url or not is_allowed_commons_image_url(source_url):
+                continue
+            try:
+                preview = quantized_grid(
+                    download_commons_image(source_url),
+                    preview_size,
+                    preview_colors,
+                )
+            except Exception:
+                app.logger.warning("Skipping unusable Commons result", exc_info=True)
+                continue
+            title = str(page.get("title") or "Photo")
+            clean_title = title[5:] if title.lower().startswith("file:") else title
+            results.append({
+                "id": str(page.get("pageid") or len(results) + 1),
+                "title": clean_title[:80],
+                "source_url": source_url,
+                "source_page": "https://commons.wikimedia.org/wiki/" + quote(title.replace(" ", "_")),
+                **preview,
+            })
+            if len(results) >= limit:
+                break
+
+        if not results:
+            return jsonify({
+                "status": "empty",
+                "error": "No usable photos found. Try a different search",
+                "results": [],
+            }), 404
+        return jsonify({"status": "complete", "query": query, "results": results})
+    except Exception as exc:
+        app.logger.exception("Could not search Wikimedia Commons")
+        return jsonify({"error": "photo search failed", "detail": str(exc)}), 503
+
+
+@app.route("/library/convert", methods=["POST"])
+def library_convert():
+    data = request.get_json(force=True, silent=True) or {}
+    source_url = str(data.get("source_url") or "").strip()
+    size = bounded_int(data.get("size"), 125, 4, MAX_OUTPUT_SIZE)
+    max_colors = bounded_int(data.get("colors"), DEFAULT_MAX_COLORS, 2, 64)
+    try:
+        result = quantized_grid(download_commons_image(source_url), size, max_colors)
+        result.update({"status": "complete", "provider": "wikimedia-commons"})
+        return jsonify(result)
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+    except Exception as exc:
+        app.logger.exception("Could not convert Wikimedia Commons image")
+        return jsonify({"error": "photo conversion failed", "detail": str(exc)}), 503
 
 
 @app.route("/generate/start", methods=["POST"])
@@ -250,6 +399,7 @@ def health():
         "status": "ok",
         "provider": "ai-horde",
         "queue_mode": True,
+        "photo_library": "wikimedia-commons",
         "anonymous": AI_HORDE_API_KEY == "0000000000",
         "max_output_size": MAX_OUTPUT_SIZE,
         "source_image_size": SOURCE_IMAGE_SIZE,
