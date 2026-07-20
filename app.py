@@ -167,7 +167,10 @@ def library_search():
         "generator": "search",
         "gsrsearch": query + " filetype:bitmap",
         "gsrnamespace": 6,
-        "gsrlimit": 15,
+        # Commons search results often include GIF/TIFF/DjVu files that this game
+        # intentionally skips. Pull a wider candidate pool so five usable JPEG/PNG/WebP
+        # previews are still returned for ordinary searches.
+        "gsrlimit": 50,
         "prop": "imageinfo",
         "iiprop": "url|mime|size",
         "iiurlwidth": 640,
